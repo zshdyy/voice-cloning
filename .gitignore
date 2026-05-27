@@ -19,6 +19,13 @@ converted/
 out_*.wav
 out_*.flac
 out_*.mp3
+converted_*.wav
+test_16k_auto_*.wav
+test_16k_converted_female.wav
+temp_ascii.wav
+vc_*.wav
+tools/search_freevc_results.txt
+tools/voice_env_pkglist_*.txt
 *.png
 
 # OS
