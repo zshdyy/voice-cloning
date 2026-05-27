@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual environments
+.venv/
+.venv-1/
+voice_env/
+voice_env_clean/
+
+# Logs
+*.log
+
+# Generated outputs
+converted/
+*.mask.npy
+out_*.wav
+out_*.flac
+out_*.mp3
+*.png
+
+# OS
+.DS_Store
+Thumbs.db
