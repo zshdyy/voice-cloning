@@ -1312,11 +1312,13 @@ class VoiceChangerApp(QMainWindow):
         try:
             duration, warnings = _duration_status(filepath, role)
             self.log_message(f"ℹ️ {role}时长: {duration:.2f}s")
-            show_popup = self.combo_mode.currentIndex() == 1
-            for warn in warnings:
-                self.log_message(f"⚠️ {warn}")
-                if show_popup:
-                    QMessageBox.warning(self, "时长提醒", warn)
+            show_warnings = role.startswith("目标")
+            if show_warnings:
+                show_popup = self.combo_mode.currentIndex() == 1
+                for warn in warnings:
+                    self.log_message(f"⚠️ {warn}")
+                    if show_popup:
+                        QMessageBox.warning(self, "时长提醒", warn)
             return duration
         except Exception as e:
             self.log_message(f"⚠️ 无法检测{role}时长: {e}")
@@ -1508,17 +1510,7 @@ class VoiceChangerApp(QMainWindow):
         # 时长检查：克隆模式过短直接提醒并停止；单音模式仅提示
         try:
             source_duration, source_warnings = _duration_status(self.current_filepath, "源音频")
-            if source_duration < MIN_AUDIO_LENGTH and not is_vc_mode:
-                warn_text = source_warnings[0] if source_warnings else f"源音频太短，至少需要 {MIN_AUDIO_LENGTH:.0f}s。"
-                QMessageBox.warning(self, "时长不足", warn_text)
-                self.log_message(f"⚠️ {warn_text}")
-                self.btn_convert.setEnabled(True)
-                self._refresh_action_state()
-                return
-            for warn_text in source_warnings:
-                self.log_message(f"⚠️ {warn_text}")
-                if is_vc_mode:
-                    QMessageBox.warning(self, "时长提醒", warn_text)
+            # 源音频不再做时长限制与提醒
         except Exception as e:
             self.log_message(f"⚠️ 源音频时长检测失败: {e}")
             QMessageBox.warning(self, "时长检测失败", f"源音频时长检测失败：{e}")
