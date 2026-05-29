@@ -157,15 +157,21 @@ python voice_gui.py
 1. 安装 Coqui TTS 到独立环境（示例：`tts_py310`）
 2. 配置 `env_map.json` 指向该环境的 Python
 
-示例（已预置）：
+示例（请替换为你本机路径）：
 
 ```json
 {
-    "声线克隆（双音频）": "C:\\Users\\zhangs\\.conda\\envs\\tts_py310\\python.exe"
+    "声线克隆（双音频）": "C:\\PATH\\TO\\tts_py310\\python.exe",
+    "声线克隆（OpenVoice）": "C:\\PATH\\TO\\openvoice_py310\\python.exe",
+    "OpenVoice_Checkpoints": ".\\checkpoints_v2"
 }
 ```
 
 如果你更换环境路径，请同步更新 `env_map.json`。
+
+## OpenVoice 大文件说明
+
+OpenVoice checkpoints 里有超过 100MB 的文件，上传到 GitHub 需要使用 Git LFS。
 
 ## 交付给同学的建议
 
@@ -174,6 +180,16 @@ python voice_gui.py
 **压缩包**：适合一次性交付或对方不想用 Git 的情况。
 
 如果用 GitHub，建议把 `voice_env_clean` 和任何本地虚拟环境排除，不上传。
+
+## 回退旧版本
+
+已在 GitHub 上创建了 `old-main` 标签，指向更新前的版本。
+如需回退，可以在 GitHub 上直接切换到该标签，或本地执行：
+
+```cmd
+git fetch origin
+git checkout old-main
+```
 
 ### 📊 pitch_ratio（音调升高倍数）
 
