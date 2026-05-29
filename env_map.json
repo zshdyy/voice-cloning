@@ -1,3 +1,5 @@
 {
-  "声线克隆（双音频）": "C:\\REPLACE_WITH_YOUR_TTS_ENV\\python.exe"
+  "声线克隆（双音频）": "C:\\Users\\zhangs\\.conda\\envs\\tts_py310\\python.exe",
+  "声线克隆（OpenVoice）": "C:\\Users\\zhangs\\.conda\\envs\\openvoice_py310\\python.exe",
+  "OpenVoice_Checkpoints": "D:\\大三下\\语音pro\\checkpoints_v2"
 }

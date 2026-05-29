@@ -146,14 +146,11 @@ def _duration_status(path, role):
 
 def _convert_to_temp_wav(path, prefix):
     """将任意输入音频转成 16k 单声道临时 WAV，供 TTS 声线转换使用。"""
-    try:
-        y, sr = librosa.load(path, sr=16000, mono=True, dtype=np.float32)
-        fd, temp_path = tempfile.mkstemp(prefix=prefix, suffix=".wav")
-        os.close(fd)
-        sf.write(temp_path, y, 16000)
-        return temp_path
-    except Exception:
-        # librosa/audioread 可能因缺少解码后端而失败，使用 ffmpeg 命令行作为回退
+    # For non-WAV inputs, prefer ffmpeg to avoid audioread/mpg123 errors.
+    ext = os.path.splitext(path)[1].lower()
+    prefer_ffmpeg = ext != ".wav"
+
+    def _ffmpeg_convert():
         # 优先使用项目内的 ffmpeg/bin/ffmpeg.exe，其次使用 PATH 中的 ffmpeg
         local_ffmpeg = os.path.join(os.path.dirname(__file__), "ffmpeg", "bin", "ffmpeg.exe")
         ffmpeg_cmd = None
@@ -196,6 +193,18 @@ def _convert_to_temp_wav(path, prefix):
                 pass
             raise RuntimeError(f"ffmpeg 转换失败 (rc={proc.returncode})，请检查 ffmpeg 可用性。stderr: {proc.stderr.decode(errors='ignore')}")
         return temp_path
+
+    if prefer_ffmpeg:
+        return _ffmpeg_convert()
+
+    try:
+        y, sr = librosa.load(path, sr=16000, mono=True, dtype=np.float32)
+        fd, temp_path = tempfile.mkstemp(prefix=prefix, suffix=".wav")
+        os.close(fd)
+        sf.write(temp_path, y, 16000)
+        return temp_path
+    except Exception:
+        return _ffmpeg_convert()
 
 
 def apply_energy_vad(y, fs, frame_ms=20, threshold_ratio=0.05):
@@ -524,9 +533,10 @@ class VoiceCloneThread(QThread):
     log_signal = pyqtSignal(str)
     finished_signal = pyqtSignal(str)
 
-    def __init__(self, source_path, target_paths):
+    def __init__(self, source_path, target_paths, engine="FreeVC"):
         super().__init__()
         self.source_path = source_path
+        self.engine = engine
         # target_paths 可为列表（多参考样本）或单个路径
         if isinstance(target_paths, (list, tuple)):
             self.target_paths = list(target_paths)
@@ -542,9 +552,18 @@ class VoiceCloneThread(QThread):
             sr_target = 16000
             for p in path:
                 try:
-                    y, sr = librosa.load(p, sr=sr_target, mono=True, dtype=np.float32)
+                    seg_temp = _convert_to_temp_wav(p, f"{prefix}seg_")
+                    self._temp_files.append(seg_temp)
+                    y, sr = sf.read(seg_temp, dtype="float32")
+                    if y is None:
+                        continue
+                    if y.ndim > 1:
+                        y = np.mean(y, axis=1)
+                    if sr != sr_target:
+                        y = librosa.resample(y, orig_sr=sr, target_sr=sr_target)
                     combined.append(y)
-                except Exception:
+                except Exception as e:
+                    self.log_signal.emit(f"⚠️ 参考音频处理失败: {os.path.basename(p)} ({e})")
                     # 跳过有问题的文件
                     pass
             if len(combined) == 0:
@@ -576,15 +595,23 @@ class VoiceCloneThread(QThread):
             try:
                 map_path = os.path.join(os.path.dirname(__file__), 'env_map.json')
                 python_exec = None
+                openvoice_ckpt = None
                 if os.path.exists(map_path):
                     import json
                     with open(map_path, 'r', encoding='utf-8') as f:
                         emap = json.load(f)
-                        python_exec = emap.get('声线克隆（双音频）')
+                        if self.engine == "OpenVoice":
+                            python_exec = emap.get('声线克隆（OpenVoice）')
+                            openvoice_ckpt = emap.get('OpenVoice_Checkpoints')
+                        else:
+                            python_exec = emap.get('声线克隆（双音频）')
 
                 if python_exec and os.path.exists(python_exec):
                     self.log_signal.emit(f"📡 使用外部 Python: {python_exec} 执行声线克隆")
-                    runner = os.path.join(os.path.dirname(__file__), 'tools', 'clone_runner.py')
+                    if self.engine == "OpenVoice":
+                        runner = os.path.join(os.path.dirname(__file__), 'tools', 'openvoice_runner.py')
+                    else:
+                        runner = os.path.join(os.path.dirname(__file__), 'tools', 'clone_runner.py')
                     # 组织输出路径
                     output_dir = os.path.dirname(self.source_path)
                     source_base = os.path.splitext(os.path.basename(self.source_path))[0]
@@ -593,6 +620,8 @@ class VoiceCloneThread(QThread):
                     output_path = os.path.join(output_dir, f"vc_{source_base}_to_{target_base}.wav")
 
                     cmd = [python_exec, runner, '--source', source_temp, '--target', target_temp, '--out', output_path]
+                    if self.engine == "OpenVoice" and openvoice_ckpt:
+                        cmd.extend(["--ckpt_dir", openvoice_ckpt])
                     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
                     # stream stdout/stderr back to GUI
                     for line in proc.stdout:
@@ -903,6 +932,18 @@ class VoiceChangerApp(QMainWindow):
         self.target_info_label = QLabel("目标音频: 未选择")
         self.target_info_label.setStyleSheet("font-size: 12px; color: #666; padding: 4px 0px;")
         layout.addWidget(self.target_info_label)
+        
+        clone_engine_row = QHBoxLayout()
+        self.clone_engine_label = QLabel("克隆引擎:")
+        self.clone_engine_label.setStyleSheet("font-size: 13px; font-weight: bold; color: #555; min-width: 120px;")
+        self.combo_clone_engine = QComboBox()
+        self.combo_clone_engine.addItems(["FreeVC", "OpenVoice"])
+        self.combo_clone_engine.setCurrentText("FreeVC")
+        self.combo_clone_engine.setStyleSheet("QComboBox { font-size: 13px; padding: 4px; min-width: 160px; }")
+        clone_engine_row.addWidget(self.clone_engine_label)
+        clone_engine_row.addWidget(self.combo_clone_engine)
+        clone_engine_row.addStretch(1)
+        layout.addLayout(clone_engine_row)
 
         # [新增] VAD 预处理复选框
         self.chk_vad = QCheckBox("🔕 开启 VAD 预处理 (过滤环境底噪与静音)")
@@ -1292,6 +1333,12 @@ class VoiceChangerApp(QMainWindow):
             self.btn_choose_target.setVisible(is_vc_mode)
         except Exception:
             pass
+        
+        try:
+            self.clone_engine_label.setVisible(is_vc_mode)
+            self.combo_clone_engine.setVisible(is_vc_mode)
+        except Exception:
+            pass
 
         self._refresh_action_state()
 
@@ -1539,7 +1586,13 @@ class VoiceChangerApp(QMainWindow):
                 self._refresh_action_state()
                 return
 
-            self.thread = VoiceCloneThread(self.current_filepath, self.target_filepaths)
+            engine = "FreeVC"
+            try:
+                engine = self.combo_clone_engine.currentText()
+            except Exception:
+                pass
+
+            self.thread = VoiceCloneThread(self.current_filepath, self.target_filepaths, engine=engine)
             self.thread.log_signal.connect(self.log_message)
             self.thread.finished_signal.connect(self.conversion_finished)
             self.thread.start()
