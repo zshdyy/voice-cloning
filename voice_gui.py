@@ -412,7 +412,7 @@ def plot_mel_spectrogram_comparison(input_path, converted_path, save_path):
     mel_before_db = librosa.power_to_db(mel_before, ref=np.max)
     mel_after_db = librosa.power_to_db(mel_after, ref=np.max)
 
-    fig, axes = plt.subplots(1, 2, figsize=(14, 5), sharey=True)
+    fig, axes = plt.subplots(1, 2, figsize=(15, 5), sharey=True, constrained_layout=True)
     img1 = librosa.display.specshow(
         mel_before_db,
         sr=fs,
@@ -429,16 +429,17 @@ def plot_mel_spectrogram_comparison(input_path, converted_path, save_path):
         sr=fs,
         hop_length=hop_length,
         x_axis="time",
-        y_axis="mel",
+        y_axis=None,
         cmap="magma",
         ax=axes[1],
     )
     axes[1].set_title("Mel Spectrogram - After", fontweight="bold")
+    axes[1].set_ylabel("")
+    axes[1].tick_params(axis="y", left=False, labelleft=False)
 
-    cbar = fig.colorbar(img1, ax=axes.ravel().tolist(), format="%+2.0f dB", shrink=0.85)
+    cbar = fig.colorbar(img1, ax=axes, format="%+2.0f dB", shrink=0.88, pad=0.02)
     cbar.set_label("dB")
     fig.suptitle(f"Mel Spectrogram Comparison - {os.path.basename(input_path)}", fontweight="bold")
-    plt.tight_layout()
     plt.savefig(save_path, dpi=140)
     plt.close()
 
@@ -533,16 +534,100 @@ class VoiceCloneThread(QThread):
     log_signal = pyqtSignal(str)
     finished_signal = pyqtSignal(str)
 
-    def __init__(self, source_path, target_paths, engine="FreeVC"):
+    def __init__(self, source_path, target_paths, engine="FreeVC", openvoice_tau=0.3, openvoice_vad=True):
         super().__init__()
         self.source_path = source_path
         self.engine = engine
+        self.openvoice_tau = max(0.0, min(1.0, float(openvoice_tau)))
+        self.openvoice_vad = bool(openvoice_vad)
         # target_paths 可为列表（多参考样本）或单个路径
         if isinstance(target_paths, (list, tuple)):
             self.target_paths = list(target_paths)
         else:
             self.target_paths = [target_paths]
         self._temp_files = []
+
+    def _load_env_map(self):
+        map_path = os.path.join(os.path.dirname(__file__), 'env_map.json')
+        if not os.path.exists(map_path):
+            return {}
+        try:
+            import json
+            with open(map_path, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except Exception as e:
+            self.log_signal.emit(f"⚠️ 读取 env_map.json 失败: {e}")
+            return {}
+
+    def _run_similarity_eval(self, reference_path, candidate_path, output_path, env_map):
+        try:
+            openvoice_python = env_map.get('声线克隆（OpenVoice）')
+            openvoice_ckpt = env_map.get('OpenVoice_Checkpoints')
+            if not openvoice_python or not os.path.exists(openvoice_python):
+                self.log_signal.emit("⚠️ 未配置可用的 OpenVoice Python，跳过 Speaker Similarity 评估")
+                return
+
+            if not openvoice_ckpt or not os.path.exists(openvoice_ckpt):
+                self.log_signal.emit("⚠️ 未配置可用的 OpenVoice checkpoints，跳过 Speaker Similarity 评估")
+                return
+
+            runner = os.path.join(os.path.dirname(__file__), 'tools', 'speaker_similarity_runner.py')
+            if not os.path.exists(runner):
+                self.log_signal.emit("⚠️ 未找到 speaker_similarity_runner.py，跳过 Speaker Similarity 评估")
+                return
+
+            json_path = os.path.splitext(output_path)[0] + '_similarity.json'
+            rep_target = self.target_paths[0] if len(self.target_paths) > 0 else reference_path
+            cmd = [
+                openvoice_python,
+                runner,
+                '--reference', reference_path,
+                '--candidate', candidate_path,
+                '--ckpt_dir', openvoice_ckpt,
+                '--out_json', json_path,
+                '--label_reference', os.path.basename(rep_target),
+                '--label_candidate', os.path.basename(candidate_path),
+            ]
+
+            self.log_signal.emit("📊 正在评估 Speaker Similarity...")
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            stdout, stderr = proc.communicate()
+
+            if stderr:
+                for line in stderr.splitlines():
+                    if line.strip():
+                        self.log_signal.emit(line.strip())
+
+            if proc.returncode != 0:
+                self.log_signal.emit(f"⚠️ Speaker Similarity 评估失败，rc={proc.returncode}")
+                return
+
+            result = None
+            if stdout:
+                for line in stdout.splitlines()[::-1]:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    if line.startswith('{') and line.endswith('}'):
+                        try:
+                            import json
+                            result = json.loads(line)
+                            break
+                        except Exception:
+                            pass
+
+            if result:
+                score = result.get('similarity_score')
+                cosine = result.get('cosine_similarity')
+                if score is not None:
+                    self.log_signal.emit(f"✅ Speaker Similarity: {score:.2f}/100")
+                if cosine is not None:
+                    self.log_signal.emit(f"ℹ️ Cosine Similarity: {cosine:.6f}")
+                self.log_signal.emit(f"ℹ️ 评估结果已保存: {json_path}")
+            else:
+                self.log_signal.emit(f"ℹ️ Speaker Similarity 评估完成，结果文件: {json_path}")
+        except Exception as e:
+            self.log_signal.emit(f"⚠️ Speaker Similarity 评估异常: {e}")
 
     def _prepare_temp_wav(self, path, prefix):
         # path 可能是单路径，也可能是 list（多个目标）
@@ -590,21 +675,17 @@ class VoiceCloneThread(QThread):
 
             source_temp = self._prepare_temp_wav(self.source_path, "voice_source_")
             target_temp = self._prepare_temp_wav(self.target_paths, "voice_target_")
+            env_map = self._load_env_map()
 
             # 首先尝试使用外部映射到的 Python 环境来运行声线克隆（避免在 GUI env 安装 heavy 依赖）
             try:
-                map_path = os.path.join(os.path.dirname(__file__), 'env_map.json')
                 python_exec = None
                 openvoice_ckpt = None
-                if os.path.exists(map_path):
-                    import json
-                    with open(map_path, 'r', encoding='utf-8') as f:
-                        emap = json.load(f)
-                        if self.engine == "OpenVoice":
-                            python_exec = emap.get('声线克隆（OpenVoice）')
-                            openvoice_ckpt = emap.get('OpenVoice_Checkpoints')
-                        else:
-                            python_exec = emap.get('声线克隆（双音频）')
+                if self.engine == "OpenVoice":
+                    python_exec = env_map.get('声线克隆（OpenVoice）')
+                    openvoice_ckpt = env_map.get('OpenVoice_Checkpoints')
+                else:
+                    python_exec = env_map.get('声线克隆（双音频）')
 
                 if python_exec and os.path.exists(python_exec):
                     self.log_signal.emit(f"📡 使用外部 Python: {python_exec} 执行声线克隆")
@@ -622,6 +703,10 @@ class VoiceCloneThread(QThread):
                     cmd = [python_exec, runner, '--source', source_temp, '--target', target_temp, '--out', output_path]
                     if self.engine == "OpenVoice" and openvoice_ckpt:
                         cmd.extend(["--ckpt_dir", openvoice_ckpt])
+                    if self.engine == "OpenVoice":
+                        cmd.extend(["--tau", f"{self.openvoice_tau:.2f}"])
+                        if not self.openvoice_vad:
+                            cmd.append("--no_vad")
                     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
                     # stream stdout/stderr back to GUI
                     for line in proc.stdout:
@@ -634,6 +719,7 @@ class VoiceCloneThread(QThread):
                     rc = proc.wait()
                     if rc == 0 and os.path.exists(output_path):
                         self.log_signal.emit("✅ 声线转换成功 (外部运行)")
+                        self._run_similarity_eval(target_temp, output_path, output_path, env_map)
                         self.finished_signal.emit(output_path)
                         return
                     else:
@@ -670,6 +756,7 @@ class VoiceCloneThread(QThread):
                 self.log_signal.emit(f"声线转换耗时: {t2 - t1:.2f}s")
                 self.log_signal.emit(f"总耗时: {t2 - t0:.2f}s")
                 self.log_signal.emit("✅ 声线转换成功 (当前环境)")
+                self._run_similarity_eval(target_temp, output_path, output_path, env_map)
                 self.finished_signal.emit(output_path)
                 return
             except Exception as e:
@@ -723,6 +810,148 @@ class PlotMelThread(QThread):
         except Exception as e:
             self.log_signal.emit(f"Mel 绘图失败: {e}")
             self.finished_signal.emit("")
+
+
+class SimilarityEvalThread(QThread):
+    log_signal = pyqtSignal(str)
+    finished_signal = pyqtSignal(object)
+
+    def __init__(self, source_path, target_paths):
+        super().__init__()
+        self.source_path = source_path
+        if isinstance(target_paths, (list, tuple)):
+            self.target_paths = list(target_paths)
+        else:
+            self.target_paths = [target_paths]
+        self._temp_files = []
+
+    def _load_env_map(self):
+        map_path = os.path.join(os.path.dirname(__file__), 'env_map.json')
+        if not os.path.exists(map_path):
+            return {}
+        try:
+            import json
+            with open(map_path, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except Exception as e:
+            self.log_signal.emit(f"⚠️ 读取 env_map.json 失败: {e}")
+            return {}
+
+    def _prepare_temp_wav(self, path, prefix):
+        if isinstance(path, (list, tuple)):
+            combined = []
+            sr_target = 16000
+            for p in path:
+                try:
+                    seg_temp = _convert_to_temp_wav(p, f"{prefix}seg_")
+                    self._temp_files.append(seg_temp)
+                    y, sr = sf.read(seg_temp, dtype="float32")
+                    if y is None:
+                        continue
+                    if y.ndim > 1:
+                        y = np.mean(y, axis=1)
+                    if sr != sr_target:
+                        y = librosa.resample(y, orig_sr=sr, target_sr=sr_target)
+                    combined.append(y)
+                except Exception as e:
+                    self.log_signal.emit(f"⚠️ 参考音频处理失败: {os.path.basename(p)} ({e})")
+            if len(combined) == 0:
+                raise RuntimeError("无法从参考音频生成临时文件：无有效文件。")
+            y_all = np.concatenate(combined, axis=0)
+            fd, temp_path = tempfile.mkstemp(prefix=prefix, suffix='.wav')
+            os.close(fd)
+            sf.write(temp_path, y_all, sr_target)
+            self._temp_files.append(temp_path)
+            return temp_path
+        temp_path = _convert_to_temp_wav(path, prefix)
+        self._temp_files.append(temp_path)
+        return temp_path
+
+    def run(self):
+        try:
+            self.log_signal.emit(f"正在加载待评估音频: {os.path.basename(self.source_path)}")
+            rep_target = self.target_paths[0] if len(self.target_paths) > 0 else ""
+            self.log_signal.emit(f"正在加载参考音频: {os.path.basename(rep_target)}")
+
+            candidate_temp = self._prepare_temp_wav(self.source_path, "similarity_candidate_")
+            reference_temp = self._prepare_temp_wav(self.target_paths, "similarity_reference_")
+
+            env_map = self._load_env_map()
+            openvoice_python = env_map.get('声线克隆（OpenVoice）')
+            openvoice_ckpt = env_map.get('OpenVoice_Checkpoints')
+            runner = os.path.join(os.path.dirname(__file__), 'tools', 'speaker_similarity_runner.py')
+
+            if not openvoice_python or not os.path.exists(openvoice_python):
+                raise RuntimeError("未配置可用的 OpenVoice Python。")
+            if not openvoice_ckpt or not os.path.exists(openvoice_ckpt):
+                raise RuntimeError("未配置可用的 OpenVoice checkpoints。")
+            if not os.path.exists(runner):
+                raise RuntimeError("未找到 speaker_similarity_runner.py。")
+
+            output_dir = os.path.dirname(self.source_path)
+            source_base = os.path.splitext(os.path.basename(self.source_path))[0]
+            target_base = os.path.splitext(os.path.basename(rep_target))[0] if rep_target else "target"
+            json_path = os.path.join(output_dir, f"similarity_{source_base}_vs_{target_base}.json")
+
+            cmd = [
+                openvoice_python,
+                runner,
+                '--reference', reference_temp,
+                '--candidate', candidate_temp,
+                '--ckpt_dir', openvoice_ckpt,
+                '--out_json', json_path,
+                '--label_reference', os.path.basename(rep_target) if rep_target else 'reference',
+                '--label_candidate', os.path.basename(self.source_path),
+            ]
+
+            self.log_signal.emit("📊 正在评估 Speaker Similarity...")
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            stdout, stderr = proc.communicate()
+
+            if stderr:
+                for line in stderr.splitlines():
+                    if line.strip():
+                        self.log_signal.emit(line.strip())
+
+            if proc.returncode != 0:
+                self.log_signal.emit(f"⚠️ Speaker Similarity 评估失败，rc={proc.returncode}")
+                self.finished_signal.emit(None)
+                return
+
+            result = None
+            if stdout:
+                for line in stdout.splitlines()[::-1]:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    if line.startswith('{') and line.endswith('}'):
+                        try:
+                            import json
+                            result = json.loads(line)
+                            break
+                        except Exception:
+                            pass
+
+            if result is not None:
+                result['result_json'] = json_path
+                score = result.get('similarity_score')
+                cosine = result.get('cosine_similarity')
+                if score is not None:
+                    self.log_signal.emit(f"✅ Speaker Similarity: {score:.2f}/100")
+                if cosine is not None:
+                    self.log_signal.emit(f"ℹ️ Cosine Similarity: {cosine:.6f}")
+                self.log_signal.emit(f"ℹ️ 评估结果已保存: {json_path}")
+            self.finished_signal.emit(result)
+        except Exception as e:
+            self.log_signal.emit(f"❌ Speaker Similarity 独立评估失败: {e}")
+            self.finished_signal.emit(None)
+        finally:
+            for temp_path in self._temp_files:
+                try:
+                    if temp_path and os.path.exists(temp_path):
+                        os.remove(temp_path)
+                except Exception:
+                    pass
 
 
 class DragDropLabel(QLabel):
@@ -853,6 +1082,7 @@ class VoiceChangerApp(QMainWindow):
         self.current_filepath = None
         self.target_filepaths = []
         self.converted_filepath = None
+        self.last_similarity_result = None
         self._temp_play_path = None
 
         self.play_obj = None
@@ -869,7 +1099,7 @@ class VoiceChangerApp(QMainWindow):
         self.play_timer.setInterval(80)
         self.play_timer.timeout.connect(self._on_playback_timer)
 
-        self.mode_names = ["WORLD 单音频变声", "声线克隆（双音频）"]
+        self.mode_names = ["WORLD 单音频变声", "声线克隆（双音频）", "说话人相似度评估"]
 
         self.initUI()
 
@@ -944,6 +1174,64 @@ class VoiceChangerApp(QMainWindow):
         clone_engine_row.addWidget(self.combo_clone_engine)
         clone_engine_row.addStretch(1)
         layout.addLayout(clone_engine_row)
+
+        tau_row = QHBoxLayout()
+        self.openvoice_tau_label = QLabel("OpenVoice tau:")
+        self.openvoice_tau_label.setStyleSheet("font-size: 13px; font-weight: bold; color: #555; min-width: 120px;")
+        self.openvoice_tau_tip_left = QLabel("保守")
+        self.openvoice_tau_tip_left.setStyleSheet("font-size: 11px; color: #5C6BC0; font-weight: bold;")
+        self.slider_openvoice_tau = QSlider(Qt.Horizontal)
+        self.slider_openvoice_tau.setRange(0, 100)
+        self.slider_openvoice_tau.setValue(30)
+        self.slider_openvoice_tau.setTickPosition(QSlider.TicksBelow)
+        self.slider_openvoice_tau.setTickInterval(10)
+        self.slider_openvoice_tau.setStyleSheet("""
+            QSlider::groove:horizontal {
+                height: 6px;
+                background-color: #ddd;
+                border-radius: 3px;
+            }
+            QSlider::handle:horizontal {
+                background-color: #5C6BC0;
+                width: 14px;
+                margin: -4px 0;
+                border-radius: 7px;
+            }
+        """)
+        self.input_openvoice_tau = QLineEdit("0.30")
+        self.input_openvoice_tau.setStyleSheet("""
+            QLineEdit {
+                font-size: 13px;
+                font-weight: bold;
+                color: #5C6BC0;
+                background-color: #f5f5f5;
+                border: 1px solid #ddd;
+                border-radius: 4px;
+                padding: 4px;
+                min-width: 60px;
+                max-width: 70px;
+            }
+        """)
+        self.input_openvoice_tau.setAlignment(Qt.AlignCenter)
+        self.input_openvoice_tau.setToolTip("仅对 OpenVoice 生效。建议先尝试 0.20 ~ 0.40。")
+        self.openvoice_tau_tip_right = QLabel("更像目标")
+        self.openvoice_tau_tip_right.setStyleSheet("font-size: 11px; color: #8E24AA; font-weight: bold;")
+        self.slider_openvoice_tau.valueChanged.connect(self._update_openvoice_tau_from_slider)
+        self.input_openvoice_tau.textChanged.connect(self._on_openvoice_tau_input_changed)
+        tau_row.addWidget(self.openvoice_tau_label)
+        tau_row.addWidget(self.openvoice_tau_tip_left)
+        tau_row.addWidget(self.slider_openvoice_tau, 1)
+        tau_row.addWidget(self.input_openvoice_tau)
+        tau_row.addWidget(self.openvoice_tau_tip_right)
+        layout.addLayout(tau_row)
+
+        self.similarity_label = QLabel("Speaker Similarity: --")
+        self.similarity_label.setStyleSheet(
+            "font-size: 14px; font-weight: bold; color: #1565C0; background-color: #E3F2FD; "
+            "border: 1px solid #90CAF9; border-radius: 6px; padding: 8px 10px;"
+        )
+        self.similarity_label.setToolTip("显示目标参考音频与克隆结果之间的说话人相似度评分。")
+        layout.addWidget(self.similarity_label)
 
         # [新增] VAD 预处理复选框
         self.chk_vad = QCheckBox("🔕 开启 VAD 预处理 (过滤环境底噪与静音)")
@@ -1224,6 +1512,7 @@ class VoiceChangerApp(QMainWindow):
         self.log_text.setStyleSheet("background-color: #2b2b2b; color: #a9b7c6; font-family: Consolas;")
         layout.addWidget(self.log_text)
 
+        self.combo_clone_engine.currentIndexChanged.connect(self._refresh_clone_engine_controls)
         self._on_mode_changed()
 
     def load_file(self, filepath):
@@ -1233,6 +1522,7 @@ class VoiceChangerApp(QMainWindow):
         
         self.current_filepath = filepath
         self.converted_filepath = None
+        self._clear_similarity_display()
 
         self.drop_label.setText(f"\n\n源音频已加载:\n{os.path.basename(filepath)}\n（内部会自动转 WAV）\n\n")
         self.source_info_label.setText(f"源音频: {os.path.basename(filepath)}")
@@ -1250,6 +1540,7 @@ class VoiceChangerApp(QMainWindow):
     def load_target_file(self, filepath):
         # 单个目标文件
         self.target_filepaths = [filepath]
+        self._clear_similarity_display()
         self.target_drop_label.setText(f"\n\n目标音频已加载:\n{os.path.basename(filepath)}\n（内部会自动转 WAV）\n\n")
         self.target_info_label.setText(f"目标音频: {os.path.basename(filepath)}")
         self._report_audio_duration(filepath, "目标音频")
@@ -1259,6 +1550,7 @@ class VoiceChangerApp(QMainWindow):
     def load_target_files(self, file_list):
         # 多个目标文件
         self.target_filepaths = list(file_list)
+        self._clear_similarity_display()
         names = [os.path.basename(p) for p in self.target_filepaths]
         display = "\n\n目标音频已加载 (%d):\n%s\n（内部会自动转 WAV）\n\n" % (len(names), " | ".join(names))
         self.target_drop_label.setText(display)
@@ -1297,10 +1589,20 @@ class VoiceChangerApp(QMainWindow):
         self.log_text.append(msg)
 
     def _on_mode_changed(self, *args):
-        is_vc_mode = self.combo_mode.currentIndex() == 1
-        self.target_title_label.setVisible(is_vc_mode)
-        self.target_drop_label.setVisible(is_vc_mode)
-        self.target_info_label.setVisible(is_vc_mode)
+        mode_index = self.combo_mode.currentIndex()
+        is_clone_mode = mode_index == 1
+        is_similarity_mode = mode_index == 2
+        is_dual_audio_mode = mode_index in (1, 2)
+
+        if is_similarity_mode:
+            self.target_title_label.setText("参考音频（说话人相似度模式）")
+        else:
+            self.target_title_label.setText("目标音频（声线克隆模式）")
+
+        self.target_title_label.setVisible(is_dual_audio_mode)
+        self.target_drop_label.setVisible(is_dual_audio_mode)
+        self.target_info_label.setVisible(is_dual_audio_mode)
+        self.similarity_label.setVisible(is_dual_audio_mode)
 
         world_controls = [
             self.vad_title,
@@ -1326,28 +1628,131 @@ class VoiceChangerApp(QMainWindow):
             self.chk_keep_noise,
         ]
         for widget in world_controls:
-            widget.setVisible(not is_vc_mode)
+            widget.setVisible(mode_index == 0)
 
         # 目标选择按钮也只在声线克隆模式可见
         try:
-            self.btn_choose_target.setVisible(is_vc_mode)
+            self.btn_choose_target.setVisible(is_dual_audio_mode)
         except Exception:
             pass
         
         try:
-            self.clone_engine_label.setVisible(is_vc_mode)
-            self.combo_clone_engine.setVisible(is_vc_mode)
+            self.clone_engine_label.setVisible(is_clone_mode)
+            self.combo_clone_engine.setVisible(is_clone_mode)
         except Exception:
             pass
 
+        self._refresh_clone_engine_controls()
         self._refresh_action_state()
 
+    def _refresh_clone_engine_controls(self):
+        is_vc_mode = self.combo_mode.currentIndex() == 1
+        is_openvoice = False
+        try:
+            is_openvoice = self.combo_clone_engine.currentText() == "OpenVoice"
+        except Exception:
+            pass
+
+        show_tau = is_vc_mode and is_openvoice
+        for widget in [
+            self.openvoice_tau_label,
+            self.openvoice_tau_tip_left,
+            self.slider_openvoice_tau,
+            self.input_openvoice_tau,
+            self.openvoice_tau_tip_right,
+        ]:
+            widget.setVisible(show_tau)
+
+    def _update_openvoice_tau_from_slider(self):
+        value = self.slider_openvoice_tau.value() / 100.0
+        self.input_openvoice_tau.blockSignals(True)
+        self.input_openvoice_tau.setText(f"{value:.2f}")
+        self.input_openvoice_tau.blockSignals(False)
+
+    def _on_openvoice_tau_input_changed(self, text):
+        try:
+            value = float(text)
+        except ValueError:
+            return
+        value = max(0.0, min(1.0, value))
+        slider_value = int(round(value * 100))
+        self.slider_openvoice_tau.blockSignals(True)
+        self.slider_openvoice_tau.setValue(slider_value)
+        self.slider_openvoice_tau.blockSignals(False)
+
+    def _clear_similarity_display(self):
+        self.last_similarity_result = None
+        self.similarity_label.setText("Speaker Similarity: --")
+        self.similarity_label.setStyleSheet(
+            "font-size: 14px; font-weight: bold; color: #1565C0; background-color: #E3F2FD; "
+            "border: 1px solid #90CAF9; border-radius: 6px; padding: 8px 10px;"
+        )
+
+    def _update_similarity_display(self, result):
+        self.last_similarity_result = result
+        score = result.get("similarity_score")
+        cosine = result.get("cosine_similarity")
+        ref_label = result.get("reference_label") or "reference"
+
+        if score is None:
+            self.similarity_label.setText("Speaker Similarity: 无结果")
+            return
+
+        score_val = float(score)
+        if score_val >= 85:
+            color = "#2E7D32"
+            bg = "#E8F5E9"
+            border = "#81C784"
+            level = "高相似"
+        elif score_val >= 70:
+            color = "#EF6C00"
+            bg = "#FFF3E0"
+            border = "#FFB74D"
+            level = "中等相似"
+        else:
+            color = "#C62828"
+            bg = "#FFEBEE"
+            border = "#E57373"
+            level = "较低相似"
+
+        cosine_text = "--"
+        if cosine is not None:
+            cosine_text = f"{float(cosine):.6f}"
+
+        self.similarity_label.setText(
+            f"Speaker Similarity: {score_val:.2f}/100  |  {level}  |  参考: {ref_label}  |  Cosine: {cosine_text}"
+        )
+        self.similarity_label.setStyleSheet(
+            f"font-size: 14px; font-weight: bold; color: {color}; background-color: {bg}; "
+            f"border: 1px solid {border}; border-radius: 6px; padding: 8px 10px;"
+        )
+
+    def _load_similarity_from_output(self, output_path):
+        try:
+            json_path = os.path.splitext(output_path)[0] + '_similarity.json'
+            if not os.path.exists(json_path):
+                return None
+            import json
+            with open(json_path, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except Exception as e:
+            self.log_message(f"⚠️ 读取相似度结果失败: {e}")
+            return None
+
     def _refresh_action_state(self):
-        if self.combo_mode.currentIndex() == 1:
+        mode_index = self.combo_mode.currentIndex()
+        if mode_index == 1:
             can_convert = bool(self.current_filepath and self.target_filepaths)
             self.btn_convert.setText("开始克隆")
             self.btn_plot_f0.setEnabled(bool(self.current_filepath))
             self.btn_plot_mel.setEnabled(bool(self.converted_filepath and os.path.exists(self.converted_filepath)))
+            self.btn_play_converted.setEnabled(bool(self.converted_filepath and os.path.exists(self.converted_filepath)))
+        elif mode_index == 2:
+            can_convert = bool(self.current_filepath and self.target_filepaths)
+            self.btn_convert.setText("开始评估")
+            self.btn_plot_f0.setEnabled(False)
+            self.btn_plot_mel.setEnabled(False)
+            self.btn_play_converted.setEnabled(False)
         else:
             can_convert = bool(self.current_filepath)
             self.btn_convert.setText("开始转换")
@@ -1540,10 +1945,14 @@ class VoiceChangerApp(QMainWindow):
         if not self.current_filepath:
             return
 
-        is_vc_mode = self.combo_mode.currentIndex() == 1
-        if is_vc_mode and not self.target_filepaths:
-            QMessageBox.warning(self, "缺少目标音频", "声线克隆模式需要同时选择目标音频。")
-            self.log_message("⚠️ 声线克隆模式缺少目标音频。")
+        self._clear_similarity_display()
+
+        mode_index = self.combo_mode.currentIndex()
+        is_vc_mode = mode_index == 1
+        is_similarity_mode = mode_index == 2
+        if (is_vc_mode or is_similarity_mode) and not self.target_filepaths:
+            QMessageBox.warning(self, "缺少参考音频", "当前模式需要同时选择两段音频。")
+            self.log_message("⚠️ 当前模式缺少参考音频。")
             return
 
         # 在开始转换前，先停止任何正在进行的播放
@@ -1565,7 +1974,7 @@ class VoiceChangerApp(QMainWindow):
             self._refresh_action_state()
             return
 
-        if is_vc_mode:
+        if is_vc_mode or is_similarity_mode:
             try:
                 for idx, target_path in enumerate(self.target_filepaths, start=1):
                     target_duration, target_warnings = _duration_status(target_path, f"目标音频{idx}")
@@ -1586,13 +1995,44 @@ class VoiceChangerApp(QMainWindow):
                 self._refresh_action_state()
                 return
 
+        if is_similarity_mode:
+            self.converted_filepath = None
+            self.similarity_thread = SimilarityEvalThread(self.current_filepath, self.target_filepaths)
+            self.similarity_thread.log_signal.connect(self.log_message)
+            self.similarity_thread.finished_signal.connect(self.similarity_eval_finished)
+            self.similarity_thread.start()
+            return
+
+        if is_vc_mode:
             engine = "FreeVC"
             try:
                 engine = self.combo_clone_engine.currentText()
             except Exception:
                 pass
 
-            self.thread = VoiceCloneThread(self.current_filepath, self.target_filepaths, engine=engine)
+            if engine == "OpenVoice" and source_duration < MIN_AUDIO_LENGTH:
+                warn_text = (
+                    f"OpenVoice 对源音频较敏感，当前仅 {source_duration:.2f}s，可能偏机械。\n"
+                    f"系统会自动补长后再提取说话人特征；建议 tau 先调到 0.20~0.25。\n"
+                    f"如果仍不稳定，优先换更长、更清晰的源音频再试。\n"
+                    f"建议源音频时长至少 {MIN_AUDIO_LENGTH:.0f}s。"
+                )
+                self.log_message(f"⚠️ {warn_text}")
+                QMessageBox.warning(self, "时长提醒", warn_text)
+
+            openvoice_tau = 0.3
+            if engine == "OpenVoice":
+                try:
+                    openvoice_tau = max(0.0, min(1.0, float(self.input_openvoice_tau.text().strip())))
+                except Exception:
+                    openvoice_tau = 0.3
+
+            self.thread = VoiceCloneThread(
+                self.current_filepath,
+                self.target_filepaths,
+                engine=engine,
+                openvoice_tau=openvoice_tau,
+            )
             self.thread.log_signal.connect(self.log_message)
             self.thread.finished_signal.connect(self.conversion_finished)
             self.thread.start()
@@ -1645,11 +2085,31 @@ class VoiceChangerApp(QMainWindow):
         if output_path:
             self.converted_filepath = output_path
             self.log_message(f"文件已保存至: {output_path}")
+            if self.combo_mode.currentIndex() == 1:
+                similarity_result = self._load_similarity_from_output(output_path)
+                if similarity_result:
+                    self._update_similarity_display(similarity_result)
+                else:
+                    self.similarity_label.setText("Speaker Similarity: 本次未生成结果")
             self.log_message("-" * 32)
             self.btn_play_converted.setEnabled(True)
             self.btn_plot_mel.setEnabled(True)
         else:
+            if self.combo_mode.currentIndex() == 1:
+                self.similarity_label.setText("Speaker Similarity: 转换失败，未生成结果")
             self.log_message("转换失败。")
+
+    def similarity_eval_finished(self, result):
+        self._refresh_action_state()
+        if result:
+            self.converted_filepath = None
+            self._update_similarity_display(result)
+            result_json = result.get('result_json')
+            if result_json:
+                self.log_message(f"相似度结果已保存至: {result_json}")
+            self.log_message("-" * 32)
+        else:
+            self.similarity_label.setText("Speaker Similarity: 评估失败，未生成结果")
 
     def on_plot_f0_clicked(self):
         if not self.current_filepath:

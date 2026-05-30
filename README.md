@@ -131,6 +131,24 @@ python voice_gui.py
 | **Mel 对比** | 点击\"保存 Mel 对比图\" | 并排显示转换前后 Mel 语谱图（共振峰迁移可视化） |
 | **实时反馈** | 下方文本框 | 转换进度和输出文件路径 |
 
+#### GUI 三种工作模式：
+
+1. **WORLD 单音频变声**
+   - 输入一段音频
+   - 输出 `converted_<原文件名>.wav`
+   - 可保存 `F0` 与 `Mel` 对比图
+
+2. **声线克隆（双音频）**
+   - 输入：源音频 + 目标参考音频
+   - 支持 `FreeVC` / `OpenVoice`
+   - `OpenVoice` 支持 `tau` 调节
+   - 克隆完成后自动计算 `Speaker Similarity`
+
+3. **说话人相似度评估**
+   - 输入：两段音频
+   - 输出：两段音频的 `Speaker Similarity`
+   - 会在界面中直接显示分数，并保存 `similarity_*.json`
+
 #### 输出位置：
 
 - **转换音频**：同输入目录，文件名为 `converted_<原始名>.wav`（非 WAV 输入会自动转 WAV 输出）
@@ -168,6 +186,39 @@ python voice_gui.py
 ```
 
 如果你更换环境路径，请同步更新 `env_map.json`。
+
+## Speaker Similarity（说话人相似度）说明
+
+本项目已集成独立的说话人相似度评估流程，核心脚本为 `tools/speaker_similarity_runner.py`。
+
+### 评估输入与输出
+
+- **输入**：参考音频 + 待评估音频
+- **输出**：
+  - GUI 中显示 `Speaker Similarity`
+  - 保存 `similarity_*.json` 结果文件
+
+### 评估方法
+
+- 使用 `OpenVoice` 的说话人特征提取器提取两段音频的 `speaker embedding`
+- 计算余弦相似度 `cosine similarity`
+- 映射为 `0~100` 分的展示分数
+
+### 结果解释（工程展示口径）
+
+- `85 ~ 100`：高相似
+- `70 ~ 85`：中等相似
+- `< 70`：相似度较低
+
+### 超短音频兜底
+
+对极短音频（如 1~2 秒），系统会在提取说话人特征前自动补长，再继续走本地评估流程，以降低 `input audio is too short` 之类失败概率。
+
+### OpenVoice tau 建议
+
+- `0.20 ~ 0.25`：更稳、更自然
+- `0.30`：默认平衡值
+- `0.35 ~ 0.40`：更像目标，但更容易出现机械感
 
 ## OpenVoice 大文件说明
 

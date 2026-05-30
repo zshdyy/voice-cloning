@@ -24,9 +24,20 @@ test_16k_auto_*.wav
 test_16k_converted_female.wav
 temp_ascii.wav
 vc_*.wav
+*_similarity.json
+similarity_*.json
+voice_source_*/
+voice_target_*/
+similarity_reference_*/
+similarity_candidate_*/
+ov_embed_ext_*/
+spk_sim_ext_*/
 tools/search_freevc_results.txt
 tools/voice_env_pkglist_*.txt
 *.png
+
+# Temporary Office files
+~$*.docx
 
 # OS
 .DS_Store
