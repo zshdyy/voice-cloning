@@ -268,7 +268,7 @@ class VoiceChangerApp(QMainWindow):
         self.initUI()
 
     def initUI(self):
-        self.setWindowTitle("智能性别语音转换系统 - 深度增强版")
+        self.setWindowTitle("智能语音隐私保护与声线转换系统 - 融合增强版")
         self.resize(760, 560)
 
         central_widget = QWidget()

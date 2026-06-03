@@ -3,6 +3,8 @@ import os
 import time
 import tempfile
 import subprocess
+import json
+import shutil
 from collections import deque
 import numpy as np
 import librosa
@@ -354,19 +356,37 @@ def _analyze_and_convert(x, fs, strength=1.0):
     return _inner(x, fs, strength=float(strength))
 
 
-def plot_f0_histogram(input_path, save_path, bins=50):
+def _extract_valid_f0_for_plot(audio_path):
+    x, fs = librosa.load(audio_path, sr=None, dtype=np.float64)
+    if x.size == 0:
+        raise RuntimeError(f"音频为空: {os.path.basename(audio_path)}")
+    x = np.ascontiguousarray(x, dtype=np.float64)
+    f0, _ = pw.dio(x, int(fs), frame_period=5.0)
+    valid_f0 = f0[f0 > 0]
+    if len(valid_f0) == 0:
+        raise RuntimeError(f"未检测到有效基频: {os.path.basename(audio_path)}")
+    return valid_f0
+
+
+def plot_f0_histogram(input_path, save_path, converted_path=None, bins=50):
     import matplotlib
 
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    x, fs = librosa.load(input_path, sr=None, dtype=np.float64)
-    _, f0_before, f0_after, _, _ = _analyze_and_convert(x, fs)
+    if converted_path and os.path.exists(converted_path):
+        valid_f0_before = _extract_valid_f0_for_plot(input_path)
+        valid_f0_after = _extract_valid_f0_for_plot(converted_path)
+        title_after = "After Processing"
+    else:
+        x, fs = librosa.load(input_path, sr=None, dtype=np.float64)
+        _, f0_before, f0_after, _, _ = _analyze_and_convert(x, fs)
 
-    valid_f0_before = f0_before[f0_before > 0]
-    valid_f0_after = f0_after[f0_after > 0]
-    if len(valid_f0_before) == 0 or len(valid_f0_after) == 0:
-        raise RuntimeError("未检测到有效基频，无法绘制直方图。")
+        valid_f0_before = f0_before[f0_before > 0]
+        valid_f0_after = f0_after[f0_after > 0]
+        if len(valid_f0_before) == 0 or len(valid_f0_after) == 0:
+            raise RuntimeError("未检测到有效基频，无法绘制直方图。")
+        title_after = "After Conversion"
 
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4))
     ax1.hist(valid_f0_before, bins=bins, color="#FF9800", edgecolor="#222", alpha=0.7)
@@ -378,7 +398,7 @@ def plot_f0_histogram(input_path, save_path, bins=50):
     ax2.hist(valid_f0_after, bins=bins, color="#4CAF50", edgecolor="#222", alpha=0.7)
     ax2.set_xlabel("F0 (Hz)")
     ax2.set_ylabel("Count")
-    ax2.set_title("After Conversion", fontweight="bold")
+    ax2.set_title(title_after, fontweight="bold")
     ax2.grid(axis="y", alpha=0.3)
 
     fig.suptitle(f"F0 Comparison - {os.path.basename(input_path)}", fontweight="bold")
@@ -395,6 +415,8 @@ def plot_mel_spectrogram_comparison(input_path, converted_path, save_path):
 
     x, fs = librosa.load(input_path, sr=None, dtype=np.float32)
     y, fs2 = librosa.load(converted_path, sr=fs, dtype=np.float32)
+    if x.size == 0 or y.size == 0:
+        raise RuntimeError("音频为空，无法绘制 Mel 对比图。")
     if fs2 != fs:
         raise RuntimeError("采样率不一致，无法绘制 Mel 对比图。")
 
@@ -771,23 +793,102 @@ class VoiceCloneThread(QThread):
                     pass
 
 
+class AnonymizationThread(QThread):
+    log_signal = pyqtSignal(str)
+    finished_signal = pyqtSignal(object)
+
+    def __init__(self, source_path, denoise_preset="standard"):
+        super().__init__()
+        self.source_path = source_path
+        self.denoise_preset = denoise_preset
+
+    def run(self):
+        try:
+            import json
+
+            project_dir = os.path.dirname(__file__)
+            runner = os.path.join(project_dir, "tools", "anonymization_runner.py")
+            external_project = os.path.join(project_dir, "_external", "EE328_Speech-Signal-Processing")
+            if not os.path.exists(runner):
+                raise FileNotFoundError(f"未找到匿名化 runner: {runner}")
+            if not os.path.exists(external_project):
+                raise FileNotFoundError(f"未找到匿名化模块目录: {external_project}")
+
+            output_dir = os.path.dirname(self.source_path)
+            source_base = os.path.splitext(os.path.basename(self.source_path))[0]
+            out_json = os.path.join(output_dir, f"anon_{source_base}_result.json")
+            work_root = os.path.join(external_project, "gui_work", f"{source_base}_{int(time.time())}")
+
+            cmd = [
+                sys.executable,
+                runner,
+                "--source",
+                self.source_path,
+                "--project-root",
+                external_project,
+                "--work-root",
+                work_root,
+                "--out-dir",
+                output_dir,
+                "--out-json",
+                out_json,
+                "--denoise-preset",
+                self.denoise_preset,
+            ]
+            self.log_signal.emit("📡 正在执行匿名化处理...")
+            self.log_signal.emit(" ".join(cmd))
+
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace")
+            if proc.stdout is not None:
+                for line in proc.stdout:
+                    line = line.rstrip()
+                    if line:
+                        self.log_signal.emit(line)
+            err = proc.stderr.read() if proc.stderr is not None else ""
+            if err:
+                for line in err.splitlines():
+                    if line.strip():
+                        self.log_signal.emit(line.strip())
+
+            rc = proc.wait()
+            if rc != 0:
+                self.log_signal.emit(f"❌ 匿名化进程失败，rc={rc}")
+                self.finished_signal.emit(None)
+                return
+
+            if not os.path.exists(out_json):
+                self.log_signal.emit(f"❌ 未生成匿名化结果 JSON: {out_json}")
+                self.finished_signal.emit(None)
+                return
+
+            with open(out_json, "r", encoding="utf-8") as f:
+                result = json.load(f)
+            self.log_signal.emit("✅ 匿名化完成")
+            self.finished_signal.emit(result)
+        except Exception as e:
+            self.log_signal.emit(f"❌ 匿名化失败: {e}")
+            self.finished_signal.emit(None)
+
+
 class PlotF0Thread(QThread):
     log_signal = pyqtSignal(str)
     finished_signal = pyqtSignal(str)
 
-    def __init__(self, input_path, save_path):
+    def __init__(self, input_path, save_path, converted_path=None):
         super().__init__()
         self.input_path = input_path
         self.save_path = save_path
+        self.converted_path = converted_path
 
     def run(self):
         try:
             self.log_signal.emit(f"绘制 F0 对比图: {os.path.basename(self.input_path)}")
-            plot_f0_histogram(self.input_path, self.save_path)
+            plot_f0_histogram(self.input_path, self.save_path, self.converted_path)
             self.log_signal.emit("F0 对比图已保存")
             self.finished_signal.emit(self.save_path)
         except Exception as e:
-            self.log_signal.emit(f"F0 绘图失败: {e}")
+            reason = str(e) or e.__class__.__name__
+            self.log_signal.emit(f"F0 绘图失败: {reason}")
             self.finished_signal.emit("")
 
 
@@ -808,7 +909,8 @@ class PlotMelThread(QThread):
             self.log_signal.emit("Mel 对比图已保存")
             self.finished_signal.emit(self.save_path)
         except Exception as e:
-            self.log_signal.emit(f"Mel 绘图失败: {e}")
+            reason = str(e) or e.__class__.__name__
+            self.log_signal.emit(f"Mel 绘图失败: {reason}")
             self.finished_signal.emit("")
 
 
@@ -1082,6 +1184,9 @@ class VoiceChangerApp(QMainWindow):
         self.current_filepath = None
         self.target_filepaths = []
         self.converted_filepath = None
+        self.anonymized_variants = {}
+        self.anonymized_variant_order = []
+        self.last_anonymization_result = None
         self.last_similarity_result = None
         self._temp_play_path = None
 
@@ -1099,12 +1204,12 @@ class VoiceChangerApp(QMainWindow):
         self.play_timer.setInterval(80)
         self.play_timer.timeout.connect(self._on_playback_timer)
 
-        self.mode_names = ["WORLD 单音频变声", "声线克隆（双音频）", "说话人相似度评估"]
+        self.mode_names = ["WORLD 声学特征转换", "声线克隆（双音频）", "说话人相似度评估", "语音隐私匿名化"]
 
         self.initUI()
 
     def initUI(self):
-        self.setWindowTitle("智能性别语音转换系统 - 深度增强版")
+        self.setWindowTitle("智能语音隐私保护与声线转换系统 - 融合增强版")
         self.resize(760, 560)
 
         central_widget = QWidget()
@@ -1470,11 +1575,45 @@ class VoiceChangerApp(QMainWindow):
         self.btn_play_converted.setEnabled(False)
         player_row.addWidget(self.btn_play_converted)
 
+        self.combo_anon_variant = QComboBox()
+        self.combo_anon_variant.setToolTip("选择要试听/另存的匿名化方法输出")
+        self.combo_anon_variant.setStyleSheet("QComboBox { font-size: 13px; padding: 3px; min-width: 170px; }")
+        self.combo_anon_variant.setEnabled(False)
+        self.combo_anon_variant.currentIndexChanged.connect(self._sync_selected_anonymized_output)
+        player_row.addWidget(self.combo_anon_variant)
+
+        self.btn_play_anon_male = QPushButton("播放所选匿名结果")
+        self.btn_play_anon_male.clicked.connect(self.play_selected_anonymized)
+        self.btn_play_anon_male.setEnabled(False)
+        self.btn_play_anon_male.setStyleSheet("font-size: 13px; background-color: #3F51B5; color: white;")
+        player_row.addWidget(self.btn_play_anon_male)
+
+        self.btn_save_anon_selected = QPushButton("另存匿名结果")
+        self.btn_save_anon_selected.clicked.connect(self.save_selected_anonymized)
+        self.btn_save_anon_selected.setEnabled(False)
+        self.btn_save_anon_selected.setStyleSheet("font-size: 13px; background-color: #607D8B; color: white;")
+        player_row.addWidget(self.btn_save_anon_selected)
+
         self.btn_stop = QPushButton("停止播放")
         self.btn_stop.clicked.connect(self.stop_playback)
         self.btn_stop.setEnabled(False)
         player_row.addWidget(self.btn_stop)
         layout.addLayout(player_row)
+
+        self.anonymization_summary_label = QTextEdit()
+        self.anonymization_summary_label.setReadOnly(True)
+        self.anonymization_summary_label.setMinimumHeight(190)
+        self.anonymization_summary_label.setMaximumHeight(260)
+        self.anonymization_summary_label.setStyleSheet(
+            "QTextEdit {font-size: 13px; color: #311B92; background-color: #F8F5FF; "
+            "border: 1px solid #B39DDB; border-radius: 8px; padding: 8px 10px; "
+            "font-family: 'Microsoft YaHei', Consolas;}"
+        )
+        self.anonymization_summary_label.setToolTip(
+            "按阶段展示匿名化 pipeline 指标：预处理、baseline/三方法候选、声学质量、输出文件。"
+        )
+        self.anonymization_summary_label.setText("匿名化结果: --")
+        layout.addWidget(self.anonymization_summary_label)
 
         self.slider_position = QSlider(Qt.Horizontal)
         self.slider_position.setRange(0, 0)
@@ -1521,7 +1660,10 @@ class VoiceChangerApp(QMainWindow):
             self.stop_playback()
         
         self.current_filepath = filepath
-        self.converted_filepath = None
+        self.anonymized_variants = {}
+        self.anonymized_variant_order = []
+        self.last_anonymization_result = None
+        self._clear_anonymization_display()
         self._clear_similarity_display()
 
         self.drop_label.setText(f"\n\n源音频已加载:\n{os.path.basename(filepath)}\n（内部会自动转 WAV）\n\n")
@@ -1533,6 +1675,9 @@ class VoiceChangerApp(QMainWindow):
         self._refresh_action_state()
         self.btn_plot_f0.setEnabled(True)
         self.btn_plot_mel.setEnabled(False)
+        self.btn_play_anon_male.setEnabled(False)
+        self.combo_anon_variant.setEnabled(False)
+        self.btn_save_anon_selected.setEnabled(False)
         self.btn_play_original.setEnabled(True)
         self.btn_play_converted.setEnabled(False)
         self.btn_stop.setEnabled(True)
@@ -1592,10 +1737,13 @@ class VoiceChangerApp(QMainWindow):
         mode_index = self.combo_mode.currentIndex()
         is_clone_mode = mode_index == 1
         is_similarity_mode = mode_index == 2
+        is_anonymization_mode = mode_index == 3
         is_dual_audio_mode = mode_index in (1, 2)
 
         if is_similarity_mode:
             self.target_title_label.setText("参考音频（说话人相似度模式）")
+        elif is_anonymization_mode:
+            self.target_title_label.setText("匿名化模式无需目标音频")
         else:
             self.target_title_label.setText("目标音频（声线克隆模式）")
 
@@ -1603,6 +1751,12 @@ class VoiceChangerApp(QMainWindow):
         self.target_drop_label.setVisible(is_dual_audio_mode)
         self.target_info_label.setVisible(is_dual_audio_mode)
         self.similarity_label.setVisible(is_dual_audio_mode)
+        self.anonymization_summary_label.setVisible(is_anonymization_mode)
+
+        self.btn_play_converted.setText("播放最佳匿名" if is_anonymization_mode else "播放转换后")
+        self.combo_anon_variant.setVisible(is_anonymization_mode)
+        self.btn_play_anon_male.setVisible(is_anonymization_mode)
+        self.btn_save_anon_selected.setVisible(is_anonymization_mode)
 
         world_controls = [
             self.vad_title,
@@ -1753,12 +1907,499 @@ class VoiceChangerApp(QMainWindow):
             self.btn_plot_f0.setEnabled(False)
             self.btn_plot_mel.setEnabled(False)
             self.btn_play_converted.setEnabled(False)
+        elif mode_index == 3:
+            can_convert = bool(self.current_filepath)
+            self.btn_convert.setText("开始匿名化")
+            self.btn_plot_f0.setEnabled(bool(self.current_filepath))
+            self.btn_plot_mel.setEnabled(bool(self.converted_filepath and os.path.exists(self.converted_filepath)))
+            self.btn_play_converted.setEnabled(bool(self.converted_filepath and os.path.exists(self.converted_filepath)))
+            has_variants = bool(self._available_anonymized_variants())
+            self.combo_anon_variant.setEnabled(has_variants)
+            self.btn_play_anon_male.setEnabled(has_variants)
+            self.btn_save_anon_selected.setEnabled(bool(self.converted_filepath and os.path.exists(self.converted_filepath)))
         else:
             can_convert = bool(self.current_filepath)
             self.btn_convert.setText("开始转换")
             self.btn_plot_f0.setEnabled(bool(self.current_filepath))
             self.btn_plot_mel.setEnabled(bool(self.converted_filepath and os.path.exists(self.converted_filepath)))
+            self.btn_play_converted.setEnabled(bool(self.converted_filepath and os.path.exists(self.converted_filepath)))
+            self.combo_anon_variant.setEnabled(False)
+            self.btn_play_anon_male.setEnabled(False)
+            self.btn_save_anon_selected.setEnabled(False)
         self.btn_convert.setEnabled(can_convert)
+
+    def _clear_anonymization_display(self):
+        try:
+            self.anonymization_summary_label.setText("匿名化结果: --")
+        except Exception:
+            pass
+        try:
+            self.combo_anon_variant.blockSignals(True)
+            self.combo_anon_variant.clear()
+            self.combo_anon_variant.blockSignals(False)
+            self.combo_anon_variant.setEnabled(False)
+        except Exception:
+            pass
+
+    def _variant_display_name(self, variant):
+        names = {
+            "male_leaning": "低沉稳重匿名声线",
+            "female_leaning": "柔和清亮匿名声线",
+            "lab9_montage_pool": "综合自然匿名声线",
+            "ppg_tone": "内容保持型匿名版（PPG+音调）",
+            "metric_clarity": "清晰度优先匿名版（指标优化）",
+            "freevc_baseline": "FreeVC 基准匿名版",
+            "baseline": "原始参考基线",
+        }
+        return names.get(variant, variant or "匿名版本")
+
+    def _variant_label(self, variant, item=None):
+        item = item or (self.anonymized_variants or {}).get(variant) or {}
+        # 对已知匿名化策略优先使用 GUI 中更直观的中文特征名，避免上游英文/内部代号暴露给用户。
+        friendly_name = self._variant_display_name(variant)
+        label = friendly_name if friendly_name != (variant or "匿名版本") else (item.get("label") or item.get("display_name") or friendly_name)
+        score = item.get("score") or item.get("timbre_index") or item.get("privacy_score")
+        score_text = self._format_float(score, 4) if score is not None else "--"
+        return f"{label}｜匿名评分 {score_text}"
+
+    def _available_anonymized_variants(self):
+        order = list(self.anonymized_variant_order or [])
+        for variant in (self.anonymized_variants or {}).keys():
+            if variant not in order:
+                order.append(variant)
+        return [variant for variant in order if self._get_anonymized_path(variant)]
+
+    def _selected_anonymized_variant(self):
+        try:
+            data = self.combo_anon_variant.currentData()
+            if data:
+                return str(data)
+        except Exception:
+            pass
+        variants = self._available_anonymized_variants()
+        return variants[0] if variants else ""
+
+    def _sync_selected_anonymized_output(self, *args):
+        variant = self._selected_anonymized_variant()
+        path = self._get_anonymized_path(variant) if variant else ""
+        if path:
+            self.converted_filepath = path
+            self.btn_save_anon_selected.setEnabled(True)
+            self.btn_play_anon_male.setEnabled(True)
+
+    def _get_anonymized_path(self, variant):
+        item = (self.anonymized_variants or {}).get(variant) or {}
+        path = (
+            item.get("copied_output")
+            or item.get("final_output")
+            or item.get("selected_candidate")
+            or item.get("audio_path")
+            or item.get("output_path")
+            or item.get("path")
+            or item.get("wav_path")
+        )
+        if path and os.path.exists(path):
+            return path
+        return ""
+
+    def _format_float(self, value, digits=3):
+        try:
+            return f"{float(value):.{digits}f}"
+        except Exception:
+            return "--"
+
+    def _format_percent(self, value, digits=1):
+        try:
+            return f"{float(value) * 100:.{digits}f}%"
+        except Exception:
+            return "--"
+
+    def _format_metric_percent(self, value, digits=1):
+        """Format metrics that may be stored either as 0-1 ratios or 0-100 percentages."""
+        try:
+            numeric = float(value)
+            if abs(numeric) <= 1.0:
+                numeric *= 100.0
+            return f"{numeric:.{digits}f}%"
+        except Exception:
+            return "--"
+
+    def _metric_value(self, *objects, keys=()):
+        """Find the first metric value from several possibly nested result dictionaries."""
+        key_set = {str(k).lower() for k in keys}
+
+        def visit(obj):
+            if isinstance(obj, dict):
+                for key, value in obj.items():
+                    if str(key).lower() in key_set and value is not None:
+                        return value
+                for value in obj.values():
+                    found = visit(value)
+                    if found is not None:
+                        return found
+            elif isinstance(obj, list):
+                for value in obj:
+                    found = visit(value)
+                    if found is not None:
+                        return found
+            return None
+
+        for obj in objects:
+            found = visit(obj)
+            if found is not None:
+                return found
+        return None
+
+    def _display_method_name(self, variant, item=None):
+        item = item or {}
+        names = {
+            "ppg_tone": "内容保持型匿名版（PPG+音调）",
+            "metric_clarity": "清晰度优先匿名版（指标优化）",
+            "freevc_baseline": "FreeVC 基准匿名版",
+            "male_leaning": "低沉稳重匿名声线",
+            "female_leaning": "柔和清亮匿名声线",
+            "lab9_montage_pool": "综合自然匿名声线",
+            "baseline": "原始参考基线",
+        }
+        if variant in names:
+            return names[variant]
+        label = item.get("label") or item.get("display_name") or item.get("method") or item.get("name")
+        if label:
+            return str(label)
+        return names.get(variant, self._variant_display_name(variant))
+
+    def _variant_report_data(self, report, variant):
+        if not isinstance(report, dict):
+            return {}
+        for container_name in ("variants", "vc_variants", "results", "outputs"):
+            container = report.get(container_name)
+            if isinstance(container, dict) and isinstance(container.get(variant), dict):
+                return container.get(variant) or {}
+            if isinstance(container, list):
+                for row in container:
+                    if not isinstance(row, dict):
+                        continue
+                    row_variant = row.get("variant") or row.get("method") or row.get("name")
+                    if row_variant == variant:
+                        return row
+        return {}
+
+    def _baseline_source_similarity(self, report):
+        if not isinstance(report, dict):
+            return None
+        baseline = report.get("baseline") or {}
+        source_vs_source = baseline.get("source_vs_source") if isinstance(baseline, dict) else None
+        return self._metric_value(
+            source_vs_source,
+            baseline,
+            report.get("baseline_metrics"),
+            keys=("source_similarity", "source_mean_score", "target_mean_score", "speaker_similarity"),
+        )
+
+    def _variant_core_metrics(self, report, variant, item, best=None):
+        variant_data = self._variant_report_data(report, variant)
+        metric_sources = [item, best, variant_data]
+        privacy = variant_data.get("privacy") if isinstance(variant_data, dict) else None
+        utility = variant_data.get("utility") if isinstance(variant_data, dict) else None
+
+        source_similarity = self._metric_value(
+            *metric_sources,
+            privacy,
+            keys=(
+                "source_similarity",
+                "source_sim",
+                "similarity_to_source",
+                "source_speaker_similarity",
+                "protected_similarity",
+                "target_mean_score",
+            ),
+        )
+        standard_score = self._metric_value(
+            *metric_sources,
+            keys=("standard_score", "standard", "score", "timbre_index", "privacy_score", "composite_score"),
+        )
+        similarity_drop = self._metric_value(
+            *metric_sources,
+            privacy,
+            keys=("similarity_drop", "speaker_similarity_drop", "privacy_gain", "deidentification_rate", "deid_rate"),
+        )
+        if similarity_drop is None and source_similarity is not None:
+            baseline_similarity = self._baseline_source_similarity(report)
+            try:
+                baseline_similarity = float(baseline_similarity)
+                source_similarity_f = float(source_similarity)
+                if baseline_similarity > 0:
+                    similarity_drop = max(0.0, (baseline_similarity - source_similarity_f) / baseline_similarity)
+            except Exception:
+                pass
+
+        asr_wer = self._metric_value(
+            *metric_sources,
+            utility,
+            keys=("asr_wer", "wer", "word_error_rate", "char_error_rate", "cer"),
+        )
+        content_kept = self._metric_value(
+            *metric_sources,
+            utility,
+            keys=("content_kept", "content_retention", "content_preservation", "utility_kept", "intelligibility"),
+        )
+        if content_kept is None and asr_wer is not None:
+            try:
+                wer_f = float(asr_wer)
+                content_kept = max(0.0, 1.0 - wer_f) if wer_f <= 1.0 else max(0.0, 100.0 - wer_f)
+            except Exception:
+                pass
+
+        return {
+            "method": self._display_method_name(variant, item),
+            "source_similarity": source_similarity,
+            "standard_score": standard_score,
+            "similarity_drop": similarity_drop,
+            "asr_wer": asr_wer,
+            "content_kept": content_kept,
+            "spectral_distance_db": self._metric_value(*metric_sources, keys=("spectral_distance_db",)),
+            "envelope_corr": self._metric_value(*metric_sources, keys=("envelope_corr", "envelope_correlation")),
+        }
+
+    def _core_metrics_table_lines(self, report, variant_order):
+        rows = []
+        for rank, variant in enumerate(variant_order, start=1):
+            item = self.anonymized_variants.get(variant) or {}
+            if not item:
+                continue
+            _, best = self._find_variant_evaluation(report, variant, item)
+            metrics = self._variant_core_metrics(report, variant, item, best)
+            rows.append((rank, variant, metrics))
+        if not rows:
+            return []
+
+        lines = [
+            "【核心评估指标】",
+            "  Rank  Method                         Source sim    Score↑  Sim drop  ASR WER↓  Content↑  SpecDist↑  EnvCorr↑",
+        ]
+        for rank, _variant, metrics in rows:
+            method = metrics.get("method") or "--"
+            if len(method) > 28:
+                method = method[:27] + "…"
+            lines.append(
+                f"  {rank:<5} {method:<29} "
+                f"{self._format_float(metrics.get('source_similarity'), 3):>10}  "
+                f"{self._format_float(metrics.get('standard_score'), 3):>9}  "
+                f"{self._format_metric_percent(metrics.get('similarity_drop'), 1):>8}  "
+                f"{self._format_float(metrics.get('asr_wer'), 3):>8}  "
+                f"{self._format_metric_percent(metrics.get('content_kept'), 1):>8}  "
+                f"{self._format_float(metrics.get('spectral_distance_db'), 3):>8}  "
+                f"{self._format_float(metrics.get('envelope_corr'), 3):>8}"
+            )
+        lines.append("  说明：Source sim / Sim drop / ASR WER / Content 需要额外 ASV-ASR 评估；旧版 run_pipeline.py 未生成这些字段时显示 --。")
+        lines.append("        旧版可用代理指标：Score 为同学项目综合分，越高越好；SpecDist 为谱距离，EnvCorr 为包络相关。")
+        return lines
+
+    def _basename_or_dash(self, path):
+        try:
+            return os.path.basename(path) if path else "--"
+        except Exception:
+            return "--"
+
+    def _read_json_file(self, path):
+        if not path or not os.path.exists(path):
+            return None
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return None
+
+    def _probe_brief(self, probe):
+        if not isinstance(probe, dict):
+            return "--"
+        fmt = probe.get("format") or {}
+        streams = [s for s in (probe.get("streams") or []) if s.get("codec_type") == "audio"]
+        stream = streams[0] if streams else ((probe.get("streams") or [{}])[0] if probe.get("streams") else {})
+        duration = fmt.get("duration")
+        duration_text = self._format_float(duration, 2) + "s" if duration is not None else "--"
+        sr = stream.get("sample_rate") or "--"
+        channels = stream.get("channels") or "--"
+        codec = stream.get("codec_name") or "--"
+        container = fmt.get("format_name") or "--"
+        return f"时长 {duration_text}｜采样率 {sr}Hz｜声道 {channels}｜编码 {codec}｜容器 {container}"
+
+    def _audio_stats_brief(self, stats):
+        if not isinstance(stats, dict):
+            return "--"
+        return (
+            f"时长 {self._format_float(stats.get('duration_sec'), 2)}s｜"
+            f"F0中位 {self._format_float(stats.get('median_f0_hz'), 1)} Hz｜"
+            f"有声帧 {self._format_percent(stats.get('voiced_ratio'), 1)}"
+        )
+
+    def _first_mapping_value(self, mapping):
+        if isinstance(mapping, dict) and mapping:
+            return next(iter(mapping.values()))
+        return None
+
+    def _load_anonymization_report(self, result):
+        report_path = result.get("pipeline_report") if isinstance(result, dict) else None
+        if not report_path or not os.path.exists(report_path):
+            return None
+        try:
+            with open(report_path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return None
+
+    def _find_variant_evaluation(self, report, variant, variant_item=None):
+        if not isinstance(report, dict):
+            return None, None
+        variant_data = (report.get("vc_variants") or {}).get(variant) or {}
+        evaluation_summary = variant_data.get("evaluation_summary") or {}
+        source_name = (variant_item or {}).get("source_name")
+        if source_name and source_name in evaluation_summary:
+            summary = evaluation_summary.get(source_name)
+        else:
+            summary = self._first_mapping_value(evaluation_summary)
+        if not isinstance(summary, dict):
+            return variant_data, None
+        best = summary.get("best_candidate") or self._first_mapping_value(summary.get("all_candidates") or {})
+        return variant_data, best
+
+    def _variant_metric_lines(self, report, variant, item):
+        lines = []
+        display = self._variant_display_name(variant)
+        variant_data, best = self._find_variant_evaluation(report, variant, item)
+        profile = (best or {}).get("profile") or item.get("profile") or {}
+        backend = profile.get("backend") or item.get("backend") or "--"
+        score = item.get("score")
+        if best and best.get("score") is not None:
+            score = best.get("score")
+
+        lines.append(f"【{display}】")
+        lines.append(
+            f"  选择结果：score {self._format_float(score, 4)}｜backend {backend}｜"
+            f"目标池 {profile.get('target_pool_name') or profile.get('name') or '--'}｜"
+            f"参考数 {profile.get('target_reference_count', '--')}｜策略 {profile.get('target_strategy', '--')}"
+        )
+        if best:
+            lines.append(
+                f"  质量指标：谱距离 {self._format_float(best.get('spectral_distance_db'), 3)} dB｜"
+                f"包络相关 {self._format_float(best.get('envelope_corr'), 4)}｜"
+                f"综合分 {self._format_float(best.get('score'), 4)}"
+            )
+            lines.append(f"  输出声学：{self._audio_stats_brief(best.get('candidate_stats'))}")
+            source_stats = best.get("source_stats")
+            if source_stats:
+                lines.append(f"  源声学对照：{self._audio_stats_brief(source_stats)}")
+            if best.get("spectrogram_plot"):
+                lines.append(f"  频谱图：{self._basename_or_dash(best.get('spectrogram_plot'))}")
+        else:
+            lines.append("  质量指标：报告中未找到 evaluation_summary / best_candidate。")
+
+        output_path = (
+            item.get("copied_output")
+            or item.get("final_output")
+            or item.get("selected_candidate")
+            or item.get("audio_path")
+            or item.get("output_path")
+            or item.get("path")
+            or item.get("wav_path")
+        )
+        lines.append(f"  文件：{self._basename_or_dash(output_path)}")
+        return lines
+
+    def _build_anonymization_summary_text(self, result):
+        report = self._load_anonymization_report(result)
+        selected_variant = result.get("selected_variant") or "best"
+        selected_score = result.get("selected_score")
+        selected_output = result.get("selected_output")
+
+        lines = [
+            "【匿名化总览】",
+            f"  最佳结果：{self._variant_display_name(selected_variant)}｜score {self._format_float(selected_score, 4)}",
+            f"  最佳文件：{self._basename_or_dash(selected_output)}",
+            f"  工作目录：{self._basename_or_dash(result.get('work_root'))}",
+            f"  报告文件：{self._basename_or_dash(result.get('pipeline_report'))}",
+        ]
+
+        if report:
+            lines.extend(["", "【预处理 / 降噪】"])
+            preprocess = (report.get("preprocess_outputs") or [{}])[0]
+            metadata = self._read_json_file(preprocess.get("metadata_json")) or {}
+            lines.append(f"  降噪预设：{report.get('denoise_preset') or metadata.get('denoise_preset') or '--'}")
+            lines.append(f"  标准化文件：{self._basename_or_dash(preprocess.get('normalized_wav'))}")
+            lines.append(f"  降噪文件：{self._basename_or_dash(preprocess.get('denoised_wav'))}")
+            if metadata:
+                lines.append(f"  源音频探测：{self._probe_brief(metadata.get('source_probe'))}")
+                lines.append(f"  标准化后：{self._probe_brief(metadata.get('normalized_probe'))}")
+                lines.append(f"  降噪后：{self._probe_brief(metadata.get('denoised_probe'))}")
+                lines.append(f"  标准化滤波：{metadata.get('normalize_filter') or '--'}")
+                lines.append(f"  降噪滤波：{metadata.get('denoise_filter') or '--'}")
+
+            baseline_selection = (report.get("baseline_selections") or [{}])[0]
+            baseline_eval = self._first_mapping_value(report.get("baseline_evaluation_summary") or {}) or {}
+            baseline_best = (baseline_eval or {}).get("best_candidate") if isinstance(baseline_eval, dict) else None
+            lines.extend(["", "【Baseline 匿名化参考】"])
+            if baseline_selection:
+                lines.append(
+                    f"  baseline score：{self._format_float(baseline_selection.get('score'), 4)}｜"
+                    f"输出 {self._basename_or_dash(baseline_selection.get('final_output'))}"
+                )
+            if baseline_best:
+                lines.append(
+                    f"  baseline 质量：谱距离 {self._format_float(baseline_best.get('spectral_distance_db'), 3)} dB｜"
+                    f"包络相关 {self._format_float(baseline_best.get('envelope_corr'), 4)}｜"
+                    f"综合分 {self._format_float(baseline_best.get('score'), 4)}"
+                )
+                lines.append(f"  baseline 声学：{self._audio_stats_brief(baseline_best.get('candidate_stats'))}")
+        else:
+            lines.extend(["", "【报告解析】", "  未找到 pipeline_report，当前只显示 runner 返回的简要结果。"])
+
+        variant_order = self._available_anonymized_variants()
+        if not variant_order:
+            variant_order = list(self.anonymized_variant_order or self.anonymized_variants.keys())
+
+        core_metric_lines = self._core_metrics_table_lines(report, variant_order)
+        if core_metric_lines:
+            lines.extend([""] + core_metric_lines)
+
+        for variant in variant_order:
+            lines.append("")
+            item = self.anonymized_variants.get(variant)
+            if item:
+                lines.extend(self._variant_metric_lines(report, variant, item))
+            else:
+                lines.append(f"【{self._variant_display_name(variant)}】")
+                lines.append("  未生成该方向的匿名化结果。")
+
+        lines.extend([
+            "",
+            "【按钮对应】",
+            "  播放最佳匿名：播放上方“最佳结果”文件。",
+            "  下拉框 + 播放所选匿名结果：试听当前选中的匿名化方法输出。",
+            "  另存匿名结果：保存当前最佳/当前已选匿名文件。切换下拉框后会自动另存该版本。",
+        ])
+        return "\n".join(lines)
+
+    def _update_anonymization_display(self, result):
+        variants = result.get("variants") or []
+        self.anonymized_variants = {}
+        self.anonymized_variant_order = []
+        for item in variants:
+            variant = item.get("variant") or "variant"
+            self.anonymized_variants[variant] = item
+            self.anonymized_variant_order.append(variant)
+        self.combo_anon_variant.blockSignals(True)
+        self.combo_anon_variant.clear()
+        for variant in self._available_anonymized_variants():
+            self.combo_anon_variant.addItem(self._variant_label(variant), variant)
+        selected_variant = result.get("selected_variant")
+        if selected_variant:
+            idx = self.combo_anon_variant.findData(selected_variant)
+            if idx >= 0:
+                self.combo_anon_variant.setCurrentIndex(idx)
+        self.combo_anon_variant.blockSignals(False)
+        self.combo_anon_variant.setEnabled(self.combo_anon_variant.count() > 0)
+        self._sync_selected_anonymized_output()
+        self.anonymization_summary_label.setText(self._build_anonymization_summary_text(result))
 
     def _report_audio_duration(self, filepath, role):
         try:
@@ -1950,6 +2591,7 @@ class VoiceChangerApp(QMainWindow):
         mode_index = self.combo_mode.currentIndex()
         is_vc_mode = mode_index == 1
         is_similarity_mode = mode_index == 2
+        is_anonymization_mode = mode_index == 3
         if (is_vc_mode or is_similarity_mode) and not self.target_filepaths:
             QMessageBox.warning(self, "缺少参考音频", "当前模式需要同时选择两段音频。")
             self.log_message("⚠️ 当前模式缺少参考音频。")
@@ -1994,6 +2636,18 @@ class VoiceChangerApp(QMainWindow):
                 self.btn_convert.setEnabled(True)
                 self._refresh_action_state()
                 return
+
+        if is_anonymization_mode:
+            self.converted_filepath = None
+            self.anonymized_variants = {}
+            self.anonymized_variant_order = []
+            self.last_anonymization_result = None
+            self._clear_anonymization_display()
+            self.anonymization_thread = AnonymizationThread(self.current_filepath, denoise_preset="standard")
+            self.anonymization_thread.log_signal.connect(self.log_message)
+            self.anonymization_thread.finished_signal.connect(self.anonymization_finished)
+            self.anonymization_thread.start()
+            return
 
         if is_similarity_mode:
             self.converted_filepath = None
@@ -2099,6 +2753,49 @@ class VoiceChangerApp(QMainWindow):
                 self.similarity_label.setText("Speaker Similarity: 转换失败，未生成结果")
             self.log_message("转换失败。")
 
+    def anonymization_finished(self, result):
+        self._refresh_action_state()
+        if not result:
+            self.converted_filepath = None
+            self.log_message("匿名化失败。")
+            return
+
+        selected_output = result.get("selected_output")
+        if not selected_output or not os.path.exists(selected_output):
+            self.converted_filepath = None
+            self.log_message("匿名化完成，但未找到可播放的输出文件。")
+            return
+
+        self.converted_filepath = selected_output
+        self.last_anonymization_result = result
+        self._update_anonymization_display(result)
+        selected_variant = result.get("selected_variant") or "best"
+        selected_score = result.get("selected_score")
+        self.log_message(f"匿名化最佳结果: {self._variant_display_name(selected_variant)}")
+        if selected_score is not None:
+            self.log_message(f"匿名化候选评分: {float(selected_score):.4f}")
+        for item in result.get("variants") or []:
+            variant = item.get("variant") or "variant"
+            copied = item.get("copied_output") or item.get("final_output")
+            score = item.get("score")
+            if copied:
+                if score is not None:
+                    self.log_message(f"- {self._variant_display_name(variant)}: {copied} (score={float(score):.4f})")
+                else:
+                    self.log_message(f"- {self._variant_display_name(variant)}: {copied}")
+        self.log_message(f"匿名化结果已保存至: {selected_output}")
+        report = result.get("pipeline_report")
+        if report:
+            self.log_message(f"完整 pipeline 报告: {report}")
+        self.log_message("-" * 32)
+        self.btn_play_converted.setEnabled(True)
+        has_variants = bool(self._available_anonymized_variants())
+        self.combo_anon_variant.setEnabled(has_variants)
+        self.btn_play_anon_male.setEnabled(has_variants)
+        self.btn_save_anon_selected.setEnabled(True)
+        self.btn_plot_f0.setEnabled(True)
+        self.btn_plot_mel.setEnabled(True)
+
     def similarity_eval_finished(self, result):
         self._refresh_action_state()
         if result:
@@ -2123,7 +2820,8 @@ class VoiceChangerApp(QMainWindow):
 
         self.btn_plot_f0.setEnabled(False)
         self.log_message(f"正在保存 F0 对比图: {save_path}")
-        self.plot_f0_thread = PlotF0Thread(self.current_filepath, save_path)
+        compare_path = self.converted_filepath if self.converted_filepath and os.path.exists(self.converted_filepath) else None
+        self.plot_f0_thread = PlotF0Thread(self.current_filepath, save_path, compare_path)
         self.plot_f0_thread.log_signal.connect(self.log_message)
         self.plot_f0_thread.finished_signal.connect(self.plot_f0_finished)
         self.plot_f0_thread.start()
@@ -2200,7 +2898,7 @@ class VoiceChangerApp(QMainWindow):
 
         play_path = self.converted_filepath
         # 如果用户选择播放时保留背景噪声，生成临时混合文件
-        if self.chk_keep_noise.isChecked():
+        if self.combo_mode.currentIndex() == 0 and self.chk_keep_noise.isChecked():
             try:
                 tmp = tempfile.NamedTemporaryFile(delete=False, suffix='.wav')
                 tmp_path = tmp.name
@@ -2254,6 +2952,39 @@ class VoiceChangerApp(QMainWindow):
                 play_path = self.converted_filepath
 
         self._play_file(play_path, "转换后")
+
+    def play_anonymized_variant(self, variant):
+        path = self._get_anonymized_path(variant)
+        if not path:
+            self.log_message(f"❌ {self._variant_display_name(variant)}文件不存在，无法播放。")
+            return
+        self.converted_filepath = path
+        self._play_file(path, self._variant_display_name(variant))
+
+    def play_selected_anonymized(self):
+        variant = self._selected_anonymized_variant()
+        if not variant:
+            self.log_message("❌ 没有可播放的匿名化版本。")
+            return
+        self.play_anonymized_variant(variant)
+
+    def save_selected_anonymized(self):
+        if self.combo_mode.currentIndex() == 3:
+            self._sync_selected_anonymized_output()
+        if not self.converted_filepath or not os.path.exists(self.converted_filepath):
+            self.log_message("❌ 没有可另存的匿名化结果。")
+            return
+        suggested = os.path.basename(self.converted_filepath)
+        save_path, _ = QFileDialog.getSaveFileName(
+            self, "另存匿名化结果", suggested, "WAV Files (*.wav);;All Files (*)"
+        )
+        if not save_path:
+            return
+        try:
+            shutil.copy2(self.converted_filepath, save_path)
+            self.log_message(f"✅ 匿名化结果已另存为: {save_path}")
+        except Exception as e:
+            self.log_message(f"❌ 另存匿名化结果失败: {e}")
 
     def stop_playback(self):
         """完全停止播放并清理资源"""

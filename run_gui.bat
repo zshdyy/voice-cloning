@@ -1,6 +1,6 @@
 @echo off
 REM ============================================
-REM 智能性别语音转换系统 - GUI 启动脚本 (CMD版)
+REM 智能语音隐私保护与声线转换系统 - GUI 启动脚本 (CMD版)
 REM ============================================
 REM 用途：一键启动图形界面（Windows CMD/Batch）
 REM 平台：Windows Command Prompt / Batch
@@ -12,7 +12,7 @@ cls
 color 0B
 echo.
 echo ============================================
-echo Voice Gender Changer - GUI Launcher
+echo Voice Privacy & Voice Conversion - GUI Launcher
 echo ============================================
 echo.
 
@@ -53,9 +53,9 @@ if not exist "voice_gui.py" (
 echo OK: GUI script detected
 echo.
 echo Launching GUI...
-echo - Drag a WAV file into the window
-echo - Click Start Convert to process
-echo - Use F0 chart to view/save
+echo - Drag an audio file into the window
+echo - Choose privacy anonymization or voice conversion mode
+echo - Use F0/Mel charts to view/save analysis
 echo.
 
 REM 启动 GUI

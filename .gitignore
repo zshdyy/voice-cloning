@@ -24,6 +24,15 @@ test_16k_auto_*.wav
 test_16k_converted_female.wav
 temp_ascii.wav
 vc_*.wav
+vc_*/
+anon_*.json
+anon_*.wav
+anon_verify/
+anon_verify2/
+anon_verify_multi*/
+anon_verify_multi_work*/
+s2.wav
+s5.wav
 *_similarity.json
 similarity_*.json
 voice_source_*/
@@ -35,9 +44,11 @@ spk_sim_ext_*/
 tools/search_freevc_results.txt
 tools/voice_env_pkglist_*.txt
 *.png
+_external/
 
 # Temporary Office files
 ~$*.docx
+*.docx
 
 # OS
 .DS_Store
